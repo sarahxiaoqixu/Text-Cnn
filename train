@@ -1,0 +1,91 @@
+# 构建模型
+class TextCNN(object):
+    """
+    Text CNN 用于文本分类
+    """
+    def __init__(self, config, wordEmbedding):
+
+        # 定义模型的输入
+        self.inputX = tf.placeholder(tf.int32, [None, config.sequenceLength], name="inputX")
+                                                                  #None代表一次可以输入多个样本，每个样本一行，每行由该行各个单词的index组成。
+        self.inputY = tf.placeholder(tf.float32, [None, 1], name="inputY")
+        
+        self.dropoutKeepProb = tf.placeholder(tf.float32, name="dropoutKeepProb")
+        
+        # 定义l2损失
+        l2Loss = tf.constant(0.0)
+        
+        # 词嵌入层
+        with tf.name_scope("embedding"):
+
+            # 利用预训练的词向量初始化词嵌入矩阵
+            self.W = tf.Variable(tf.cast(wordEmbedding, dtype=tf.float32, name="word2vec") ,name="W")
+            # 利用词嵌入矩阵将输入的数据中的词转换成词向量，维度[batch_size, sequence_length, embedding_size]
+            self.embeddedWords = tf.nn.embedding_lookup(self.W, self.inputX)  
+                                        #对于inputX的每一行（即每一个样本）中的每一个词的index，
+                                        #以该index为索引取出词嵌入矩阵对应的行（即该单词的词向量）
+                                        #所以对于一个句子来说，他的词向量表示维度为【sequence_length,embedding_size】
+                                        
+            # 卷积的输入是4维[batch_size, width, height, channel]，因此需要增加维度，用tf.expand_dims来增大维度
+            self.embeddedWordsExpanded = tf.expand_dims(self.embeddedWords, -1) #-1代表最后一维
+
+        # 创建卷积和池化层
+        pooledOutputs = []
+        # 有三种size的filter，3， 4， 5，textCNN是个多通道单层卷积的模型，可以看作三个单层的卷积模型的融合
+        for i, filterSize in enumerate(config.model.filterSizes):
+            with tf.name_scope("conv-maxpool-%s" % filterSize):
+                # 卷积层，卷积核尺寸为filterSize * embeddingSize，卷积核的个数为numFilters
+                # 初始化权重矩阵和偏置
+                filterShape = [filterSize, config.model.embeddingSize, 1, config.model.numFilters]  
+                                      # W 权重-卷积核：[x_size,y_size,in_channel,out_channel]
+                W = tf.Variable(tf.truncated_normal(filterShape, stddev=0.1), name="W")
+                b = tf.Variable(tf.constant(0.1, shape=[config.model.numFilters]), name="b") #b是一维的，维度和conv的最后一维相同
+                conv = tf.nn.conv2d(
+                    self.embeddedWordsExpanded,
+                    W,
+                    strides=[1, 1, 1, 1],
+                    padding="VALID",
+                    name="conv")
+                
+                # relu函数的非线性映射
+                h = tf.nn.relu(tf.nn.bias_add(conv, b), name="relu") #b是一维的，维度和conv的最后一维相同
+                
+                # 池化层，最大池化，池化是对卷积后的序列取一个最大值
+                pooled = tf.nn.max_pool(
+                    h,
+                    ksize=[1, config.sequenceLength - filterSize + 1, 1, 1],  # ksize shape: [batch, height, width, channels]channels是指池化核的通道数不是输入的通道数
+                    strides=[1, 1, 1, 1],
+                    padding='VALID',
+                    name="pool")
+                pooledOutputs.append(pooled)  # 将三种size的filter的输出一起加入到列表中
+
+        # 得到CNN网络的输出长度
+        numFiltersTotal = config.model.numFilters * len(config.model.filterSizes)
+        
+        # 池化后的维度不变，按照最后的维度channel来concat
+        self.hPool = tf.concat(pooledOutputs, 3)
+        
+        # 摊平成二维的数据输入到全连接层
+        self.hPoolFlat = tf.reshape(self.hPool, [-1, numFiltersTotal])
+
+        # dropout
+        with tf.name_scope("dropout"):
+            self.hDrop = tf.nn.dropout(self.hPoolFlat, self.dropoutKeepProb)
+       
+        # 全连接层的输出
+        with tf.name_scope("output"):
+            outputW = tf.get_variable(
+                "outputW",
+                shape=[numFiltersTotal, 1],  #1是因为这个代码里默认是二分类的
+                initializer=tf.contrib.layers.xavier_initializer())
+            outputB= tf.Variable(tf.constant(0.1, shape=[1]), name="outputB")
+            l2Loss += tf.nn.l2_loss(outputW)
+            l2Loss += tf.nn.l2_loss(outputB)
+            self.predictions = tf.nn.xw_plus_b(self.hDrop, outputW, outputB, name="predictions")
+            self.binaryPreds = tf.cast(tf.greater_equal(self.predictions, 0.5), tf.float32, name="binaryPreds") #二分类
+        
+        # 计算二元交叉熵损失
+        with tf.name_scope("loss"):
+            
+            losses = tf.nn.sigmoid_cross_entropy_with_logits(logits=self.predictions, labels=self.inputY)
+            self.loss = tf.reduce_mean(losses) + config.model.l2RegLambda * l2Loss
